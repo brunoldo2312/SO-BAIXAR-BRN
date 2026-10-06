@@ -1,7 +1,8 @@
-"""db.py — Banco SQLite do BRN (v6)
+"""db.py — Banco SQLite do BRN (v7)
 v4: + delete_blocks_above, + get_blocks_range, + peer score
 v5: + get_next_nonce, + get_nonce_for_pubkey (protecao replay)
 v6: + contratos inteligentes (tabelas contracts, contract_state, contract_events)
+v7: + idx_utxo_pubkey (acelera validate_tx com muitos UTXOs)
 """
 import time
 import zlib
@@ -49,6 +50,7 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_utxo_addr ON utxos(address, spent);
             CREATE INDEX IF NOT EXISTS idx_utxo_spent ON utxos(spent);
             CREATE INDEX IF NOT EXISTS idx_utxo_h ON utxos(block_height);
+            CREATE INDEX IF NOT EXISTS idx_utxo_pubkey ON utxos(pubkey, spent);
 
             CREATE TABLE IF NOT EXISTS mempool (
                 txid TEXT PRIMARY KEY, raw BLOB NOT NULL,
@@ -500,10 +502,6 @@ class ChainDB:
         return [dict(r) for r in rows]
 
     def contract_spend(self, from_addr: str, to_addr: str, amount: int):
-        """
-        Move fundos de from_addr para to_addr. Chamado por contracts.py.
-        Cria UTXO com txid unico (hash) para evitar colisao em ms iguais.
-        """
         import hashlib
         import os as _os
 
