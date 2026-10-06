@@ -1,12 +1,13 @@
-﻿"""
+"""
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.3 | Data: 05/10/2026
+Versão: 9.1.4 | Data: 06/10/2026
 
-Changelog v9.1.3:
+Changelog v9.1.4:
+- [PERF] validate_tx: dedupe de nonce-check e signature-check por pubkey
+  (evita varrer a tabela N vezes em transações com muitos inputs).
+
+v9.1.3:
 - [COMPAT] auth_tag so e obrigatorio a partir de AUTH_TAG_START_HEIGHT (6000).
-  Blocos anteriores (cadeia legada) sao aceitos sem HMAC.
-  Blocos antigos que TEM auth_tag continuam sendo validados (defesa em
-  profundidade). A partir de #6000, exigencia estrita.
 
 v9.1.1:
 - [PERF] _pow_search: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes.
@@ -51,7 +52,6 @@ MAX_REORG_DEPTH = 100
 
 HASH_BATCH_SIZE = 5000
 
-# v9.1.3: auth_tag obrigatorio apenas acima desta altura (cadeia legada abaixo)
 AUTH_TAG_START_HEIGHT = 6000
 
 GENESIS_PREV = "0" * 64
@@ -432,7 +432,7 @@ class Blockchain:
         raise ValueError(f"tipo de contrato desconhecido: {t}")
 
     # --------------------------------------------------------
-    # VALIDAÇÃO DE TRANSAÇÃO
+    # VALIDAÇÃO DE TRANSAÇÃO (v9.1.4 com dedupe)
     # --------------------------------------------------------
     def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
@@ -453,9 +453,14 @@ class Blockchain:
             if not inp.get("pubkey"):
                 return False, "input sem pubkey"
 
+        # v9.1.4: dedupe do nonce — todos os inputs compartilham a mesma pubkey
         tx_nonce = tx.get("nonce", 0)
+        checked_pubkeys = set()
         for inp in tx["inputs"]:
             pk = inp["pubkey"]
+            if pk in checked_pubkeys:
+                continue
+            checked_pubkeys.add(pk)
             expected = self.db.get_nonce_for_pubkey(pk)
             if tx_nonce != expected:
                 return False, (
@@ -500,9 +505,17 @@ class Blockchain:
         if in_sum - out_sum < MIN_RELAY_FEE:
             return False, "fee abaixo do minimo"
 
+        # v9.1.4: dedupe da assinatura — mesma assinatura p/ todos os inputs
         sig_hash = signing_hash(tx)
+        checked_sigs = set()
         for inp in tx["inputs"]:
-            if not Wallet.verify(sig_hash, inp.get("signature", ""), inp["pubkey"]):
+            sig = inp.get("signature", "")
+            pk = inp["pubkey"]
+            key = (sig, pk)
+            if key in checked_sigs:
+                continue
+            checked_sigs.add(key)
+            if not Wallet.verify(sig_hash, sig, pk):
                 return False, "assinatura invalida"
         return True, "ok"
 
@@ -520,10 +533,9 @@ class Blockchain:
         return True, tx["txid"]
 
     # --------------------------------------------------------
-    # VALIDAÇÃO DE BLOCO (com auth_tag + corte em AUTH_TAG_START_HEIGHT)
+    # VALIDAÇÃO DE BLOCO
     # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
-        # Genesis
         if block["height"] == 0 and prev_block is None:
             if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash:
                 return False, (
@@ -532,14 +544,12 @@ class Blockchain:
                     f"  recebido: {block['hash'][:16]}..."
                 )
 
-        # Encadeamento
         if block["prev_hash"] != (prev_block["hash"] if prev_block else self.db.tip_hash()):
             return False, "prev_hash incorreto"
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
         if block["height"] != expected_height:
             return False, "altura invalida"
 
-        # PoW
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
@@ -549,12 +559,6 @@ class Blockchain:
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
 
-        # ============================================================
-        # v9.1.3: AUTH TAG com corte em AUTH_TAG_START_HEIGHT
-        #   - Blocos 0..6000: aceitos com ou sem auth_tag
-        #   - Blocos 6001+:    auth_tag OBRIGATORIO
-        #   - Blocos antigos que TEM auth_tag: continua validando (defesa)
-        # ============================================================
         if self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas nao tem BRN_NETWORK_SECRET"
@@ -573,7 +577,6 @@ class Blockchain:
                                            self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
 
-        # Coinbase
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
