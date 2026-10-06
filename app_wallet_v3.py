@@ -1,18 +1,12 @@
 """
-app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.4.3
+app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.5.0
 ============================================================
-v3.4.3:
-  - [CRÍTICO] generate_wallet() agora PERSISTE em current_wallet.json.
-    Antes, carteiras novas só existiam na memória do pywebview e o
-    backend não conseguia achar a pubkey ao iniciar mineração.
-  - load_wallet() também persiste em current_wallet.json.
-  - start_mining() envia 'miner_pubkey' E 'pubkey' + 'private_key'.
-  - mine_block() troca 'validator_pubkey' por 'miner_pubkey'.
-  - call_faucet() envia 'miner_pubkey'/'pubkey' além de 'public_key'.
-
-v3.4.1:
-  - timeouts aumentados (leitura=30, tx=120, mina=120).
-    Evita TIMEOUT quando o miner esta em 100% CPU.
+v3.5.0 (MINERAÇÃO INTEGRADA):
+  - WalletApi mantém a carteira ativa em MEMÓRIA (self._current_wallet)
+  - _persist_wallet grava em current_wallet.enc (cifrado) via secure_store
+  - get_active_wallet lê memória primeiro, arquivo depois
+  - start_mining envia address + pubkey + private_key sem depender de JSON legado
+  - Fallback: ainda grava current_wallet.json para compatibilidade
 """
 import os
 import sys
@@ -25,6 +19,18 @@ import requests
 import webview
 
 from wallet import WalletManager
+
+# ---- secure_store: carteira ativa cifrada ----
+try:
+    from secure_store import (
+        save_current_wallet as _ss_save_current,
+        load_current_wallet as _ss_load_current,
+    )
+    _SS_AVAILABLE = True
+except Exception as _e:
+    print(f"[wallet] aviso: secure_store indisponivel ({_e})")
+    _SS_AVAILABLE = False
+
 
 # ============================================================
 # CONFIG
@@ -43,7 +49,8 @@ TIMEOUT_MINERACAO = 120
 
 CACHE_TTL = 5
 WALLET_HTML = "index_wallet.html"
-CURRENT_WALLET_FILE = "current_wallet.json"
+CURRENT_WALLET_FILE = "current_wallet.enc"
+LEGACY_WALLET_FILE = "current_wallet.json"
 
 if not WEB_PASS:
     print("ERRO: defina BRN_WEB_PASS antes de rodar.", file=sys.stderr)
@@ -75,7 +82,6 @@ def _tratar_erro_http(r):
         return {"ok": False, "msg": "❓ Endpoint nao encontrado (HTTP 404)."}
     if r.status_code == 429:
         return {"ok": False, "msg": "⏳ Muitas requisicoes."}
-
     if r.status_code >= 500:
         try:
             data = r.json()
@@ -85,7 +91,6 @@ def _tratar_erro_http(r):
         except Exception:
             pass
         return {"ok": False, "msg": f"💥 Erro no servidor (HTTP {r.status_code})."}
-
     try:
         return r.json()
     except Exception:
@@ -97,7 +102,12 @@ class WalletApi:
 
     def __init__(self):
         self._cache_saldos = {}
+        # v3.5.0: carteira ativa em memória (address, public_key, private_key)
+        self._current_wallet = {}
 
+    # ============================================================
+    # HELPERS
+    # ============================================================
     def _cache_get(self, key):
         if key in self._cache_saldos:
             ts, val = self._cache_saldos[key]
@@ -113,30 +123,85 @@ class WalletApi:
             if k.startswith(prefix):
                 del self._cache_saldos[k]
 
+    def _wallet_password(self) -> str:
+        """Senha usada para cifrar/decifrar a carteira ativa."""
+        # usa BRN_WEB_PASS (ja obrigatoria) como senha da carteira local
+        return WEB_PASS or "brn_default_local_pass"
+
     # ============================================================
     # CARTEIRA LOCAL
     # ============================================================
     def _persist_wallet(self, address, public_key, private_key=""):
         """
-        v3.4.3: grava current_wallet.json para o backend conseguir
-        recuperar a pubkey mesmo sem payload explicito.
+        v3.5.0: guarda em memória + grava current_wallet.enc (cifrado).
+        Também grava current_wallet.json (texto puro) para compatibilidade
+        com código legado que ainda lê esse arquivo.
         """
+        self._current_wallet = {
+            "address": address,
+            "public_key": public_key,
+            "private_key": private_key,
+        }
+
+        # 1) Arquivo cifrado
+        if _SS_AVAILABLE:
+            try:
+                r = _ss_save_current(self._wallet_password(), self._current_wallet)
+                if r.get("ok"):
+                    log.info(f"Carteira cifrada salva em {CURRENT_WALLET_FILE}: {address[:24]}...")
+                else:
+                    log.warning(f"_ss_save_current falhou: {r.get('msg')}")
+            except Exception as e:
+                log.warning(f"Falha ao salvar carteira cifrada: {e}")
+
+        # 2) Arquivo legado (texto puro) — só para compatibilidade
         try:
-            p = Path(__file__).parent / CURRENT_WALLET_FILE
+            p = Path(__file__).parent / LEGACY_WALLET_FILE
             with open(p, "w", encoding="utf-8") as f:
-                json.dump({
-                    "address": address,
-                    "public_key": public_key,
-                    "private_key": private_key,
-                }, f, indent=2)
-            log.info(f"Carteira persistida em {p.name}: {address[:24]}...")
-            return True
+                json.dump(self._current_wallet, f, indent=2, ensure_ascii=False)
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
         except Exception as e:
-            log.warning(f"Falha ao persistir carteira: {e}")
-            return False
+            log.debug(f"Falha ao gravar {LEGACY_WALLET_FILE}: {e}")
+
+        return True
+
+    def _load_wallet_from_disk(self):
+        """Tenta carregar a carteira do disco (cifrada, depois texto puro)."""
+        # 1) Cifrado
+        if _SS_AVAILABLE:
+            try:
+                r = _ss_load_current(self._wallet_password())
+                if r.get("ok") and r.get("address"):
+                    self._current_wallet = {
+                        "address": r.get("address", ""),
+                        "public_key": r.get("public_key", ""),
+                        "private_key": r.get("private_key", ""),
+                    }
+                    return True
+            except Exception as e:
+                log.debug(f"Nao carregou current_wallet.enc: {e}")
+
+        # 2) Legado (texto puro)
+        try:
+            p = Path(__file__).parent / LEGACY_WALLET_FILE
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("address"):
+                    self._current_wallet = {
+                        "address": data.get("address", ""),
+                        "public_key": data.get("public_key") or data.get("pubkey") or "",
+                        "private_key": data.get("private_key") or data.get("sk") or "",
+                    }
+                    return True
+        except Exception:
+            pass
+        return False
 
     def generate_wallet(self):
-        """v3.4.3: persiste imediatamente para o backend encontrar a pubkey."""
         try:
             w = WalletManager.generate_keypair()
             self._persist_wallet(
@@ -156,20 +221,13 @@ class WalletApi:
             return False
 
     def get_active_wallet(self):
-        try:
-            p = Path(__file__).parent / CURRENT_WALLET_FILE
-            if not p.exists():
-                return {"ok": False, "msg": "Nenhuma carteira ativa"}
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-            return {
-                "ok": True,
-                "address": data.get("address", ""),
-                "public_key": data.get("public_key") or data.get("pubkey") or "",
-                "private_key": data.get("private_key", ""),
-            }
-        except Exception as e:
-            return {"ok": False, "msg": str(e)}
+        # 1) Memória
+        if self._current_wallet.get("address"):
+            return {"ok": True, **self._current_wallet}
+        # 2) Disco
+        if self._load_wallet_from_disk():
+            return {"ok": True, **self._current_wallet}
+        return {"ok": False, "msg": "Nenhuma carteira ativa"}
 
     # ============================================================
     # LEITURA (nó)
@@ -232,9 +290,6 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    # ============================================================
-    # EXPLORADOR
-    # ============================================================
     def list_blocks(self, start=0, limit=15):
         try:
             r = requests.get(f"{EXPLORER_URL}/api/latest", timeout=TIMEOUT_LEITURA)
@@ -313,6 +368,13 @@ class WalletApi:
         if amount_f < 0.00001:
             return {"ok": False, "msg": "Valor muito pequeno (minimo 0.00001)."}
 
+        # Se sk/pk vierem vazios, tenta da carteira ativa
+        if not sk or not pk:
+            w = self.get_active_wallet()
+            if w.get("ok") and w.get("address") == sender:
+                sk = sk or w.get("private_key", "")
+                pk = pk or w.get("public_key", "")
+
         payload = {
             "type": "transfer", "asset_id": asset_id,
             "from": sender, "to": to, "amount": amount_f,
@@ -327,14 +389,13 @@ class WalletApi:
                 return _tratar_erro_http(r)
             return r.json()
         except requests.exceptions.ConnectionError:
-            return {"ok": False, "msg": f"🔌 No offline."}
+            return {"ok": False, "msg": "🔌 No offline."}
         except requests.exceptions.Timeout:
             return {"ok": False, "msg": "⏱️ Timeout."}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     def mine_block(self, addr, pk=""):
-        """Minera UM bloco (sincrono). Preferir start_mining()."""
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
         try:
@@ -351,7 +412,7 @@ class WalletApi:
                 return resp
             return _tratar_erro_http(r)
         except requests.exceptions.ConnectionError:
-            return {"ok": False, "msg": f"🔌 No offline."}
+            return {"ok": False, "msg": "🔌 No offline."}
         except requests.exceptions.Timeout:
             return {"ok": False, "msg": "⏱️ Timeout na mineracao."}
         except Exception as e:
@@ -380,43 +441,52 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     # ============================================================
-    # MINER LOOP
+    # MINER LOOP  ←  v3.5.0 com carteira em memória
     # ============================================================
     def start_mining(self, address, pubkey="", sk=""):
         """
-        v3.4.3: se pubkey/sk vierem vazios do JS, tenta ler do
-        current_wallet.json (que foi persistido por generate_wallet
-        ou load_wallet).
+        v3.5.0: usa a carteira ativa em MEMÓRIA. Se os argumentos
+        vierem vazios (JS só passou o endereço), preenche a partir
+        de self._current_wallet.
         """
         if not self.validate_address(address):
             return {"ok": False, "msg": "Endereco invalido."}
 
+        # 1) Se já temos a carteira em memória e bate com o address, usa
+        if self._current_wallet.get("address") == address:
+            if not pubkey:
+                pubkey = self._current_wallet.get("public_key", "")
+            if not sk:
+                sk = self._current_wallet.get("private_key", "")
+
+        # 2) Se ainda falta algo, tenta carregar do disco
         if not pubkey or not sk:
-            try:
-                p = Path(__file__).parent / CURRENT_WALLET_FILE
-                if p.exists():
-                    with open(p, encoding="utf-8") as f:
-                        d = json.load(f)
-                    if d.get("address") == address:
-                        if not pubkey:
-                            pubkey = d.get("public_key") or d.get("pubkey") or ""
-                        if not sk:
-                            sk = d.get("private_key", "")
-            except Exception:
-                pass
+            if not self._current_wallet.get("address"):
+                self._load_wallet_from_disk()
+            if self._current_wallet.get("address") == address:
+                if not pubkey:
+                    pubkey = self._current_wallet.get("public_key", "")
+                if not sk:
+                    sk = self._current_wallet.get("private_key", "")
+
+        if not pubkey:
+            return {"ok": False, "msg": "Carteira sem public_key. Regenere a carteira."}
 
         try:
             payload = {"validator_address": address}
-            if pubkey:
-                payload["miner_pubkey"] = pubkey
-                payload["pubkey"] = pubkey
+            payload["miner_pubkey"] = pubkey
+            payload["pubkey"] = pubkey
             if sk:
                 payload["private_key"] = sk
+
             r = requests.post(f"{API_URL}/api/miner/start",
                               auth=AUTH, json=payload, timeout=TIMEOUT_MINERACAO)
             if r.status_code != 200:
                 return _tratar_erro_http(r)
-            return r.json()
+            resp = r.json()
+            if resp.get("ok"):
+                log.info(f"Mineracao iniciada para {address[:24]}...")
+            return resp
         except requests.exceptions.ConnectionError:
             return {"ok": False, "msg": f"🔌 No offline em {API_URL}."}
         except requests.exceptions.Timeout:
@@ -444,7 +514,11 @@ class WalletApi:
                              auth=AUTH, timeout=TIMEOUT_LEITURA)
             if r.status_code != 200:
                 return {"ok": False, "running": False, "msg": f"HTTP {r.status_code}"}
-            return r.json()
+            data = r.json()
+            # Se o servidor não retorna o endereço, usa o da carteira em memória
+            if not data.get("address") and self._current_wallet.get("address"):
+                data["address"] = self._current_wallet["address"]
+            return data
         except requests.exceptions.ConnectionError:
             return {"ok": False, "running": False, "msg": "no offline"}
         except requests.exceptions.Timeout:
@@ -493,7 +567,7 @@ class WalletApi:
         return {"ok": False, "msg": "Bridge nao disponivel nesta versao"}
 
     # ============================================================
-    # PERSISTENCIA LOCAL
+    # PERSISTENCIA LOCAL (wallets nomeadas)
     # ============================================================
     def save_wallet(self, filename, password, address, sk, pk):
         try:
@@ -502,7 +576,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def load_wallet(self, filename, password):
-        """v3.4.3: também persiste em current_wallet.json."""
         try:
             r = WalletManager.load_encrypted_wallet(filename, password)
             if r.get("ok"):
@@ -535,7 +608,7 @@ def main():
     api = WalletApi()
 
     log.info("=" * 60)
-    log.info("  🚀 BRN Wallet v3.4.3")
+    log.info("  🚀 BRN Wallet v3.5.0 (mineracao integrada)")
     log.info(f"  API_URL      : {API_URL}")
     log.info(f"  EXPLORER_URL : {EXPLORER_URL}")
     log.info(f"  HTML         : {index_path.name}")
